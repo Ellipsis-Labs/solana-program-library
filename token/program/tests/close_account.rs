@@ -1,7 +1,7 @@
 #![cfg(feature = "test-sbf")]
 
 use {
-    solana_program_test::{processor, tokio, ProgramTest, ProgramTestContext},
+    solana_program_test::{tokio, ProgramTest, ProgramTestContext},
     solana_sdk::{
         instruction::InstructionError,
         program_pack::Pack,
@@ -13,7 +13,6 @@ use {
     },
     spl_token::{
         instruction,
-        processor::Processor,
         state::{Account, Mint},
     },
 };
@@ -79,8 +78,7 @@ async fn setup_mint_and_account(
 
 #[tokio::test]
 async fn success_init_after_close_account() {
-    let program_test =
-        ProgramTest::new("spl_token", spl_token::id(), processor!(Processor::process));
+    let program_test = ProgramTest::new("spl_token", spl_token::id(), None);
     let mut context = program_test.start_with_context().await;
     let mint = Keypair::new();
     let token_account = Keypair::new();
@@ -137,8 +135,7 @@ async fn success_init_after_close_account() {
 
 #[tokio::test]
 async fn fail_init_after_close_account() {
-    let program_test =
-        ProgramTest::new("spl_token", spl_token::id(), processor!(Processor::process));
+    let program_test = ProgramTest::new("spl_token", spl_token::id(), None);
     let mut context = program_test.start_with_context().await;
     let mint = Keypair::new();
     let token_account = Keypair::new();

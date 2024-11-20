@@ -1,7 +1,7 @@
 //! State transition types
 
 use {
-    crate::instruction::MAX_SIGNERS,
+    crate::{error::TokenError, instruction::MAX_SIGNERS},
     arrayref::{array_mut_ref, array_ref, array_refs, mut_array_refs},
     num_enum::TryFromPrimitive,
     solana_program::{
@@ -30,6 +30,29 @@ pub struct Mint {
     /// Optional authority to freeze token accounts.
     pub freeze_authority: COption<Pubkey>,
 }
+
+impl Mint {
+    /// Enforce that the mint is initialized
+    #[inline(always)]
+    pub fn enforce_data_integrity(mint_data: &[u8]) -> Result<(), ProgramError> {
+        if mint_data.len() != Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        match array_ref![mint_data, 45, 1] {
+            [0] => Err(ProgramError::UninitializedAccount),
+            [1] => Ok(()),
+            _ => Err(ProgramError::InvalidAccountData),
+        }
+    }
+
+    /// Directly read the decimals from the source slice of mint data
+    #[inline(always)]
+    pub fn read_decimals(src: &[u8]) -> Result<u8, ProgramError> {
+        Self::enforce_data_integrity(src)?;
+        Ok(array_ref![src, 44, 1][0])
+    }
+}
+
 impl Sealed for Mint {}
 impl IsInitialized for Mint {
     fn is_initialized(&self) -> bool {
@@ -102,7 +125,10 @@ pub struct Account {
     /// rent-exempt reserve. An Account is required to be rent-exempt, so
     /// the value is used by the Processor to ensure that wrapped SOL
     /// accounts do not drop below this threshold.
-    pub is_native: COption<u64>,
+    pub is_native: u32,
+    /// if `is_native` is 1, this is the the rent-exempt reserve,
+    /// otherwise, this is the decimals of the mint
+    pub rent_exempt_or_decimals_reserved: u64,
     /// The amount delegated
     pub delegated_amount: u64,
     /// Optional authority to close the account.
@@ -115,13 +141,132 @@ impl Account {
     }
     /// Checks if account is native
     pub fn is_native(&self) -> bool {
-        self.is_native.is_some()
+        self.is_native != 0
     }
     /// Checks if a token Account's owner is the `system_program` or the
     /// incinerator
-    pub fn is_owned_by_system_program_or_incinerator(&self) -> bool {
-        solana_program::system_program::check_id(&self.owner)
-            || solana_program::incinerator::check_id(&self.owner)
+    #[inline(always)]
+    pub fn is_owned_by_system_program_or_incinerator(owner: &Pubkey) -> bool {
+        solana_program::system_program::check_id(owner)
+            || solana_program::incinerator::check_id(owner)
+    }
+
+    /// Enforce that the account data is valid and load the state
+    #[inline(always)]
+    pub fn enforce_data_integrity_and_load_state(
+        account_data: &[u8],
+    ) -> Result<AccountState, ProgramError> {
+        if account_data.len() != Self::LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        AccountState::try_from_primitive(array_ref![account_data, 108, 1][0])
+            .or(Err(ProgramError::InvalidAccountData))
+    }
+
+    /// Partially unpacks an account for transfer, returning the mint and amount
+    pub fn unpack_for_transfer_dst(account_data: &[u8]) -> Result<(Pubkey, u64), ProgramError> {
+        let state = Self::enforce_data_integrity_and_load_state(account_data)?;
+        if state == AccountState::Uninitialized {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if state == AccountState::Frozen {
+            return Err(TokenError::AccountFrozen.into());
+        }
+        let src = array_ref![account_data, 0, 72];
+        let (mint, _, amount) = array_refs![src, 32, 32, 8];
+        Ok((Pubkey::new_from_array(*mint), u64::from_le_bytes(*amount)))
+    }
+
+    /// Partially unpacks an account for transfer, returning the mint, owner,
+    /// delegate, is_native, and delegated_amount
+    pub fn unpack_for_transfer_src(
+        account_data: &[u8],
+    ) -> Result<(Pubkey, Pubkey, u64, COption<Pubkey>, bool, u64), ProgramError> {
+        let state = Self::enforce_data_integrity_and_load_state(account_data)?;
+        if state == AccountState::Uninitialized {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if state == AccountState::Frozen {
+            return Err(TokenError::AccountFrozen.into());
+        }
+        let src = array_ref![account_data, 0, 165];
+        let (mint, owner, amount, delegate, _, is_native, _, delegated_amount, _) =
+            array_refs![src, 32, 32, 8, 36, 1, 4, 8, 8, 36];
+        let is_native = u32::from_le_bytes(*is_native);
+        // can only be 0 or 1
+        if is_native > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok((
+            Pubkey::new_from_array(*mint),
+            Pubkey::new_from_array(*owner),
+            u64::from_le_bytes(*amount),
+            unpack_coption_key(delegate)?,
+            is_native != 0,
+            u64::from_le_bytes(*delegated_amount),
+        ))
+    }
+
+    /// Partially unpacks an account for freeze, returning the state, is_native, and mint
+    pub fn unpack_for_freeze(
+        account_data: &[u8],
+    ) -> Result<(AccountState, bool, Pubkey), ProgramError> {
+        let state = Account::enforce_data_integrity_and_load_state(account_data)?;
+        let mint = Pubkey::new_from_array(*array_ref![account_data, 0, 32]);
+        let is_native = u32::from_le_bytes(*array_ref![account_data, 109, 4]);
+        if is_native > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok((state, is_native != 0, mint))
+    }
+
+    /// Partially unpacks an account for closing, returning the is_native, amount, owner, and close_authority
+    pub fn unpack_for_close(
+        account_data: &[u8],
+    ) -> Result<(bool, u64, Pubkey, COption<Pubkey>), ProgramError> {
+        let state = Self::enforce_data_integrity_and_load_state(account_data)?;
+        if state == AccountState::Uninitialized {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        let src = array_ref![account_data, 0, 165];
+        let (_, owner, amount, _, _, is_native, _, _, close_authority) =
+            array_refs![src, 32, 32, 8, 36, 1, 4, 8, 8, 36];
+        let is_native = u32::from_le_bytes(*is_native);
+        // can only be 0 or 1
+        if is_native > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok((
+            is_native != 0,
+            u64::from_le_bytes(*amount),
+            Pubkey::new_from_array(*owner),
+            unpack_coption_key(close_authority)?,
+        ))
+    }
+
+    /// Directly write the amount to the destination slice of account data
+    #[inline(always)]
+    pub fn write_amount(dst_account_data: &mut [u8], amount: u64) {
+        let amount_dst = array_mut_ref![dst_account_data, 64, 8];
+        *amount_dst = amount.to_le_bytes();
+    }
+
+    /// Directly write the delegated amount to the destination slice of account data
+    #[inline(always)]
+    pub fn write_delegated_amount(dst_account_data: &mut [u8], delegated_amount: u64) {
+        let delegated_amount_dst = array_mut_ref![dst_account_data, 121, 8];
+        *delegated_amount_dst = delegated_amount.to_le_bytes();
+        if delegated_amount == 0 {
+            let delegate_dst = array_mut_ref![dst_account_data, 72, 36];
+            *delegate_dst = [0; 36];
+        }
+    }
+
+    /// Directly write the state back to the destination slice of account data
+    #[inline(always)]
+    pub fn write_state(dst_account_data: &mut [u8], state: AccountState) {
+        let state_dst = array_mut_ref![dst_account_data, 108, 1];
+        state_dst[0] = state as u8;
     }
 }
 impl Sealed for Account {}
@@ -134,8 +279,22 @@ impl Pack for Account {
     const LEN: usize = 165;
     fn unpack_from_slice(src: &[u8]) -> Result<Self, ProgramError> {
         let src = array_ref![src, 0, 165];
-        let (mint, owner, amount, delegate, state, is_native, delegated_amount, close_authority) =
-            array_refs![src, 32, 32, 8, 36, 1, 12, 8, 36];
+        let (
+            mint,
+            owner,
+            amount,
+            delegate,
+            state,
+            is_native,
+            rent_exempt_or_decimals_reserved,
+            delegated_amount,
+            close_authority,
+        ) = array_refs![src, 32, 32, 8, 36, 1, 4, 8, 8, 36];
+        let is_native = u32::from_le_bytes(*is_native);
+        // can only be 0 or 1
+        if is_native > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(Account {
             mint: Pubkey::new_from_array(*mint),
             owner: Pubkey::new_from_array(*owner),
@@ -143,7 +302,8 @@ impl Pack for Account {
             delegate: unpack_coption_key(delegate)?,
             state: AccountState::try_from_primitive(state[0])
                 .or(Err(ProgramError::InvalidAccountData))?,
-            is_native: unpack_coption_u64(is_native)?,
+            is_native,
+            rent_exempt_or_decimals_reserved: u64::from_le_bytes(*rent_exempt_or_decimals_reserved),
             delegated_amount: u64::from_le_bytes(*delegated_amount),
             close_authority: unpack_coption_key(close_authority)?,
         })
@@ -157,9 +317,10 @@ impl Pack for Account {
             delegate_dst,
             state_dst,
             is_native_dst,
+            rent_exempt_or_decimals_reserved_dst,
             delegated_amount_dst,
             close_authority_dst,
-        ) = mut_array_refs![dst, 32, 32, 8, 36, 1, 12, 8, 36];
+        ) = mut_array_refs![dst, 32, 32, 8, 36, 1, 4, 8, 8, 36];
         let &Account {
             ref mint,
             ref owner,
@@ -167,6 +328,7 @@ impl Pack for Account {
             ref delegate,
             state,
             ref is_native,
+            ref rent_exempt_or_decimals_reserved,
             delegated_amount,
             ref close_authority,
         } = self;
@@ -175,7 +337,8 @@ impl Pack for Account {
         *amount_dst = amount.to_le_bytes();
         pack_coption_key(delegate, delegate_dst);
         state_dst[0] = state as u8;
-        pack_coption_u64(is_native, is_native_dst);
+        *is_native_dst = is_native.to_le_bytes();
+        *rent_exempt_or_decimals_reserved_dst = rent_exempt_or_decimals_reserved.to_le_bytes();
         *delegated_amount_dst = delegated_amount.to_le_bytes();
         pack_coption_key(close_authority, close_authority_dst);
     }
@@ -269,26 +432,6 @@ fn unpack_coption_key(src: &[u8; 36]) -> Result<COption<Pubkey>, ProgramError> {
     match *tag {
         [0, 0, 0, 0] => Ok(COption::None),
         [1, 0, 0, 0] => Ok(COption::Some(Pubkey::new_from_array(*body))),
-        _ => Err(ProgramError::InvalidAccountData),
-    }
-}
-fn pack_coption_u64(src: &COption<u64>, dst: &mut [u8; 12]) {
-    let (tag, body) = mut_array_refs![dst, 4, 8];
-    match src {
-        COption::Some(amount) => {
-            *tag = [1, 0, 0, 0];
-            *body = amount.to_le_bytes();
-        }
-        COption::None => {
-            *tag = [0; 4];
-        }
-    }
-}
-fn unpack_coption_u64(src: &[u8; 12]) -> Result<COption<u64>, ProgramError> {
-    let (tag, body) = array_refs![src, 4, 8];
-    match *tag {
-        [0, 0, 0, 0] => Ok(COption::None),
-        [1, 0, 0, 0] => Ok(COption::Some(u64::from_le_bytes(*body))),
         _ => Err(ProgramError::InvalidAccountData),
     }
 }
@@ -412,23 +555,6 @@ mod tests {
         let mut src: [u8; 36] = [0; 36];
         src[1] = 1;
         let result = unpack_coption_key(&src).unwrap_err();
-        assert_eq!(result, ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_unpack_coption_u64() {
-        let src: [u8; 12] = [0; 12];
-        let result = unpack_coption_u64(&src).unwrap();
-        assert_eq!(result, COption::None);
-
-        let mut src: [u8; 12] = [0; 12];
-        src[0] = 1;
-        let result = unpack_coption_u64(&src).unwrap();
-        assert_eq!(result, COption::Some(0));
-
-        let mut src: [u8; 12] = [0; 12];
-        src[1] = 1;
-        let result = unpack_coption_u64(&src).unwrap_err();
         assert_eq!(result, ProgramError::InvalidAccountData);
     }
 

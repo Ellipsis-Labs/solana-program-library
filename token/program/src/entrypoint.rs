@@ -2,19 +2,26 @@
 
 use {
     crate::{error::TokenError, processor::Processor},
-    solana_program::{
-        account_info::AccountInfo, entrypoint::ProgramResult, program_error::PrintProgramError,
-        pubkey::Pubkey,
+    solana_nostd_entrypoint::{
+        basic_panic_impl, entrypoint_nostd, noalloc_allocator,
+        solana_program::{
+            entrypoint::ProgramResult, program_error::PrintProgramError, pubkey::Pubkey,
+        },
+        NoStdAccountInfo,
     },
 };
 
-solana_program::entrypoint!(process_instruction);
+entrypoint_nostd!(process_instruction, 16);
+noalloc_allocator!();
+basic_panic_impl!();
 fn process_instruction(
     program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    accounts: &[NoStdAccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    if let Err(error) = Processor::process(program_id, accounts, instruction_data) {
+    if let Err(error) =
+        Processor::<NoStdAccountInfo>::process(program_id, accounts, instruction_data)
+    {
         // catch the error so we can print it
         error.print::<TokenError>();
         return Err(error);

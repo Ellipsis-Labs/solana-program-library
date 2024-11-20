@@ -2,7 +2,7 @@
 
 mod action;
 use {
-    solana_program_test::{processor, tokio, ProgramTest},
+    solana_program_test::{tokio, ProgramTest},
     solana_sdk::{
         program_pack::Pack,
         pubkey::Pubkey,
@@ -12,7 +12,6 @@ use {
     },
     spl_token::{
         id, instruction,
-        processor::Processor,
         state::{Account, Mint},
     },
 };
@@ -21,9 +20,9 @@ const TRANSFER_AMOUNT: u64 = 1_000_000_000_000_000;
 
 #[tokio::test]
 async fn initialize_mint() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(5_000); // last known 2252
-    let (banks_client, payer, recent_blockhash) = pt.start().await;
+    let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
     let owner_key = Pubkey::new_unique();
     let mint = Keypair::new();
@@ -59,7 +58,7 @@ async fn initialize_mint() {
 
 #[tokio::test]
 async fn initialize_account() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(6_000); // last known 3284
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
@@ -111,7 +110,7 @@ async fn initialize_account() {
 
 #[tokio::test]
 async fn mint_to() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(6_000); // last known 2668
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
@@ -160,7 +159,7 @@ async fn mint_to() {
 
 #[tokio::test]
 async fn transfer() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(7_000); // last known 2972
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
@@ -228,7 +227,7 @@ async fn transfer() {
 
 #[tokio::test]
 async fn burn() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(6_000); // last known 2655
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
@@ -285,7 +284,7 @@ async fn burn() {
 
 #[tokio::test]
 async fn close_account() {
-    let mut pt = ProgramTest::new("spl_token", id(), processor!(Processor::process));
+    let mut pt = ProgramTest::new("spl_token", id(), None);
     pt.set_compute_max_units(6_000); // last known 1783
     let (mut banks_client, payer, recent_blockhash) = pt.start().await;
 
