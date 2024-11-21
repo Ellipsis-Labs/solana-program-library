@@ -5,11 +5,11 @@ use {
         amount_to_ui_amount_string_trimmed,
         error::TokenError,
         instruction::{is_valid_signer_index, AuthorityType, TokenInstruction, MAX_SIGNERS},
+        nostd_adapter::IAccountInfo,
         state::{Account, AccountState, Mint, Multisig},
         try_ui_amount_into_amount,
     },
     solana_program::{
-        account_info::{next_account_info, AccountInfo},
         entrypoint::ProgramResult,
         msg,
         program::set_return_data,
@@ -19,13 +19,27 @@ use {
         program_pack::{IsInitialized, Pack},
         pubkey::{Pubkey, PUBKEY_BYTES},
         system_program,
-        sysvar::{rent::Rent, Sysvar},
+        sysvar::{rent::Rent, Sysvar, SysvarId},
     },
 };
 
+fn next_account_info<'a, A: IAccountInfo, I: Iterator<Item = &'a A>>(
+    iter: &mut I,
+) -> Result<I::Item, ProgramError> {
+    iter.next().ok_or(ProgramError::NotEnoughAccountKeys)
+}
+
+fn from_nostd_account_info<T: serde::de::DeserializeOwned, AccountInfo: IAccountInfo>(
+    account_info: &AccountInfo,
+) -> Result<T, ProgramError> {
+    bincode::deserialize(account_info.borrow_data()).map_err(|_| ProgramError::InvalidArgument)
+}
+
 /// Program state handler.
-pub struct Processor {}
-impl Processor {
+pub struct Processor<AccountInfo: IAccountInfo> {
+    _phantom: std::marker::PhantomData<AccountInfo>,
+}
+impl<AccountInfo: IAccountInfo> Processor<AccountInfo> {
     fn _process_initialize_mint(
         accounts: &[AccountInfo],
         decimals: u8,
@@ -37,12 +51,16 @@ impl Processor {
         let mint_info = next_account_info(account_info_iter)?;
         let mint_data_len = mint_info.data_len();
         let rent = if rent_sysvar_account {
-            Rent::from_account_info(next_account_info(account_info_iter)?)?
+            let rent_account = next_account_info(account_info_iter)?;
+            if !Rent::check_id(rent_account.key()) {
+                return Err(ProgramError::InvalidArgument);
+            }
+            from_nostd_account_info::<Rent, AccountInfo>(rent_account)?
         } else {
             Rent::get()?
         };
 
-        let mut mint = Mint::unpack_unchecked(&mint_info.data.borrow())?;
+        let mut mint = Mint::unpack_unchecked(mint_info.borrow_data())?;
         if mint.is_initialized {
             return Err(TokenError::AlreadyInUse.into());
         }
@@ -56,7 +74,7 @@ impl Processor {
         mint.is_initialized = true;
         mint.freeze_authority = freeze_authority;
 
-        Mint::pack(mint, &mut mint_info.data.borrow_mut())?;
+        Mint::pack(mint, mint_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -94,17 +112,22 @@ impl Processor {
         let owner = if let Some(owner) = owner {
             owner
         } else {
-            next_account_info(account_info_iter)?.key
+            next_account_info(account_info_iter)?.key()
         };
         let new_account_info_data_len = new_account_info.data_len();
         let rent = if rent_sysvar_account {
-            Rent::from_account_info(next_account_info(account_info_iter)?)?
+            let rent_account = next_account_info(account_info_iter)?;
+            if !Rent::check_id(rent_account.key()) {
+                return Err(ProgramError::InvalidArgument);
+            }
+            from_nostd_account_info::<Rent, AccountInfo>(rent_account)?
         } else {
             Rent::get()?
         };
 
-        let mut account = Account::unpack_unchecked(&new_account_info.data.borrow())?;
-        if account.is_initialized() {
+        let state = Account::enforce_data_integrity_and_load_state(new_account_info.borrow_data())?;
+
+        if state != AccountState::Uninitialized {
             return Err(TokenError::AlreadyInUse.into());
         }
 
@@ -112,32 +135,35 @@ impl Processor {
             return Err(TokenError::NotRentExempt.into());
         }
 
-        let is_native_mint = Self::cmp_pubkeys(mint_info.key, &crate::native_mint::id());
+        let is_native_mint = Self::cmp_pubkeys(mint_info.key(), &crate::native_mint::id());
         if !is_native_mint {
             Self::check_account_owner(program_id, mint_info)?;
-            let _ = Mint::unpack(&mint_info.data.borrow_mut())
+            let _ = Mint::unpack(mint_info.borrow_data_mut())
                 .map_err(|_| Into::<ProgramError>::into(TokenError::InvalidMint))?;
         }
 
-        account.mint = *mint_info.key;
-        account.owner = *owner;
-        account.close_authority = COption::None;
-        account.delegate = COption::None;
-        account.delegated_amount = 0;
-        account.state = AccountState::Initialized;
+        let mut account = Account {
+            mint: *mint_info.key(),
+            owner: *owner,
+            state: AccountState::Initialized,
+            ..Default::default()
+        };
         if is_native_mint {
             let rent_exempt_reserve = rent.minimum_balance(new_account_info_data_len);
-            account.is_native = COption::Some(rent_exempt_reserve);
+            account.is_native = 1;
+            account.rent_exempt_or_decimals_reserved = rent_exempt_reserve;
             account.amount = new_account_info
                 .lamports()
                 .checked_sub(rent_exempt_reserve)
                 .ok_or(TokenError::Overflow)?;
         } else {
-            account.is_native = COption::None;
+            account.is_native = 0;
+            let mint = Mint::unpack_unchecked(mint_info.borrow_data())?;
+            account.rent_exempt_or_decimals_reserved = mint.decimals as u64;
             account.amount = 0;
         };
 
-        Account::pack(account, &mut new_account_info.data.borrow_mut())?;
+        Account::pack(account, new_account_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -180,12 +206,16 @@ impl Processor {
         let multisig_info = next_account_info(account_info_iter)?;
         let multisig_info_data_len = multisig_info.data_len();
         let rent = if rent_sysvar_account {
-            Rent::from_account_info(next_account_info(account_info_iter)?)?
+            let rent_account = next_account_info(account_info_iter)?;
+            if !Rent::check_id(rent_account.key()) {
+                return Err(ProgramError::InvalidArgument);
+            }
+            from_nostd_account_info::<Rent, AccountInfo>(rent_account)?
         } else {
             Rent::get()?
         };
 
-        let mut multisig = Multisig::unpack_unchecked(&multisig_info.data.borrow())?;
+        let mut multisig = Multisig::unpack_unchecked(multisig_info.borrow_data())?;
         if multisig.is_initialized {
             return Err(TokenError::AlreadyInUse.into());
         }
@@ -204,11 +234,11 @@ impl Processor {
             return Err(TokenError::InvalidNumberOfRequiredSigners.into());
         }
         for (i, signer_info) in signer_infos.iter().enumerate() {
-            multisig.signers[i] = *signer_info.key;
+            multisig.signers[i] = *signer_info.key();
         }
         multisig.is_initialized = true;
 
-        Multisig::pack(multisig, &mut multisig_info.data.borrow_mut())?;
+        Multisig::pack(multisig, multisig_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -245,57 +275,62 @@ impl Processor {
         let destination_account_info = next_account_info(account_info_iter)?;
         let authority_info = next_account_info(account_info_iter)?;
 
-        let mut source_account = Account::unpack(&source_account_info.data.borrow())?;
-        let mut destination_account = Account::unpack(&destination_account_info.data.borrow())?;
+        let (
+            source_mint,
+            source_owner,
+            source_amount,
+            source_delegate,
+            source_is_native,
+            source_delegated_amount,
+        ) = Account::unpack_for_transfer_src(source_account_info.borrow_data())?;
+        let (destination_mint, destination_amount) =
+            Account::unpack_for_transfer_dst(destination_account_info.borrow_data())?;
 
-        if source_account.is_frozen() || destination_account.is_frozen() {
-            return Err(TokenError::AccountFrozen.into());
-        }
-        if source_account.amount < amount {
+        if source_amount < amount {
             return Err(TokenError::InsufficientFunds.into());
         }
-        if !Self::cmp_pubkeys(&source_account.mint, &destination_account.mint) {
+        if !Self::cmp_pubkeys(&source_mint, &destination_mint) {
             return Err(TokenError::MintMismatch.into());
         }
 
         if let Some((mint_info, expected_decimals)) = expected_mint_info {
-            if !Self::cmp_pubkeys(mint_info.key, &source_account.mint) {
+            if !Self::cmp_pubkeys(mint_info.key(), &source_mint) {
                 return Err(TokenError::MintMismatch.into());
             }
 
-            let mint = Mint::unpack(&mint_info.data.borrow_mut())?;
-            if expected_decimals != mint.decimals {
+            let mint_decimals = Mint::read_decimals(mint_info.borrow_data())?;
+            if expected_decimals != mint_decimals {
                 return Err(TokenError::MintDecimalsMismatch.into());
             }
         }
 
         let self_transfer =
-            Self::cmp_pubkeys(source_account_info.key, destination_account_info.key);
+            Self::cmp_pubkeys(source_account_info.key(), destination_account_info.key());
 
-        match source_account.delegate {
-            COption::Some(ref delegate) if Self::cmp_pubkeys(authority_info.key, delegate) => {
+        match source_delegate {
+            COption::Some(ref delegate) if Self::cmp_pubkeys(authority_info.key(), delegate) => {
                 Self::validate_owner(
                     program_id,
                     delegate,
                     authority_info,
                     account_info_iter.as_slice(),
                 )?;
-                if source_account.delegated_amount < amount {
+                if source_delegated_amount < amount {
                     return Err(TokenError::InsufficientFunds.into());
                 }
                 if !self_transfer {
-                    source_account.delegated_amount = source_account
-                        .delegated_amount
+                    let new_source_delegated_amount = source_delegated_amount
                         .checked_sub(amount)
                         .ok_or(TokenError::Overflow)?;
-                    if source_account.delegated_amount == 0 {
-                        source_account.delegate = COption::None;
-                    }
+                    Account::write_delegated_amount(
+                        source_account_info.borrow_data_mut(),
+                        new_source_delegated_amount,
+                    );
                 }
             }
             _ => Self::validate_owner(
                 program_id,
-                &source_account.owner,
+                &source_owner,
                 authority_info,
                 account_info_iter.as_slice(),
             )?,
@@ -312,32 +347,37 @@ impl Processor {
             return Ok(());
         }
 
-        source_account.amount = source_account
-            .amount
+        let new_source_account_amount = source_amount
             .checked_sub(amount)
             .ok_or(TokenError::Overflow)?;
-        destination_account.amount = destination_account
-            .amount
+        let new_destination_account_amount = destination_amount
             .checked_add(amount)
             .ok_or(TokenError::Overflow)?;
 
-        if source_account.is_native() {
+        if source_is_native {
             let source_starting_lamports = source_account_info.lamports();
-            **source_account_info.lamports.borrow_mut() = source_starting_lamports
-                .checked_sub(amount)
-                .ok_or(TokenError::Overflow)?;
+            source_account_info.set_lamports(
+                source_starting_lamports
+                    .checked_sub(amount)
+                    .ok_or(TokenError::Overflow)?,
+            );
 
             let destination_starting_lamports = destination_account_info.lamports();
-            **destination_account_info.lamports.borrow_mut() = destination_starting_lamports
-                .checked_add(amount)
-                .ok_or(TokenError::Overflow)?;
+            destination_account_info.set_lamports(
+                destination_starting_lamports
+                    .checked_add(amount)
+                    .ok_or(TokenError::Overflow)?,
+            );
         }
 
-        Account::pack(source_account, &mut source_account_info.data.borrow_mut())?;
-        Account::pack(
-            destination_account,
-            &mut destination_account_info.data.borrow_mut(),
-        )?;
+        Account::write_amount(
+            source_account_info.borrow_data_mut(),
+            new_source_account_amount,
+        );
+        Account::write_amount(
+            destination_account_info.borrow_data_mut(),
+            new_destination_account_amount,
+        );
 
         Ok(())
     }
@@ -361,18 +401,18 @@ impl Processor {
         let delegate_info = next_account_info(account_info_iter)?;
         let owner_info = next_account_info(account_info_iter)?;
 
-        let mut source_account = Account::unpack(&source_account_info.data.borrow())?;
+        let mut source_account = Account::unpack(source_account_info.borrow_data())?;
 
         if source_account.is_frozen() {
             return Err(TokenError::AccountFrozen.into());
         }
 
         if let Some((mint_info, expected_decimals)) = expected_mint_info {
-            if !Self::cmp_pubkeys(mint_info.key, &source_account.mint) {
+            if !Self::cmp_pubkeys(mint_info.key(), &source_account.mint) {
                 return Err(TokenError::MintMismatch.into());
             }
 
-            let mint = Mint::unpack(&mint_info.data.borrow_mut())?;
+            let mint = Mint::unpack(mint_info.borrow_data())?;
             if expected_decimals != mint.decimals {
                 return Err(TokenError::MintDecimalsMismatch.into());
             }
@@ -385,10 +425,10 @@ impl Processor {
             account_info_iter.as_slice(),
         )?;
 
-        source_account.delegate = COption::Some(*delegate_info.key);
+        source_account.delegate = COption::Some(*delegate_info.key());
         source_account.delegated_amount = amount;
 
-        Account::pack(source_account, &mut source_account_info.data.borrow_mut())?;
+        Account::pack(source_account, source_account_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -398,7 +438,7 @@ impl Processor {
         let account_info_iter = &mut accounts.iter();
         let source_account_info = next_account_info(account_info_iter)?;
 
-        let mut source_account = Account::unpack(&source_account_info.data.borrow())?;
+        let mut source_account = Account::unpack(source_account_info.borrow_data())?;
 
         let owner_info = next_account_info(account_info_iter)?;
 
@@ -416,7 +456,7 @@ impl Processor {
         source_account.delegate = COption::None;
         source_account.delegated_amount = 0;
 
-        Account::pack(source_account, &mut source_account_info.data.borrow_mut())?;
+        Account::pack(source_account, source_account_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -433,7 +473,7 @@ impl Processor {
         let authority_info = next_account_info(account_info_iter)?;
 
         if account_info.data_len() == Account::get_packed_len() {
-            let mut account = Account::unpack(&account_info.data.borrow())?;
+            let mut account = Account::unpack(account_info.borrow_data())?;
 
             if account.is_frozen() {
                 return Err(TokenError::AccountFrozen.into());
@@ -475,9 +515,9 @@ impl Processor {
                     return Err(TokenError::AuthorityTypeNotSupported.into());
                 }
             }
-            Account::pack(account, &mut account_info.data.borrow_mut())?;
+            Account::pack(account, account_info.borrow_data_mut())?;
         } else if account_info.data_len() == Mint::get_packed_len() {
-            let mut mint = Mint::unpack(&account_info.data.borrow())?;
+            let mut mint = Mint::unpack(account_info.borrow_data())?;
             match authority_type {
                 AuthorityType::MintTokens => {
                     // Once a mint's supply is fixed, it cannot be undone by setting a new
@@ -511,7 +551,7 @@ impl Processor {
                     return Err(TokenError::AuthorityTypeNotSupported.into());
                 }
             }
-            Mint::pack(mint, &mut account_info.data.borrow_mut())?;
+            Mint::pack(mint, account_info.borrow_data_mut())?;
         } else {
             return Err(ProgramError::InvalidArgument);
         }
@@ -531,7 +571,7 @@ impl Processor {
         let destination_account_info = next_account_info(account_info_iter)?;
         let owner_info = next_account_info(account_info_iter)?;
 
-        let mut destination_account = Account::unpack(&destination_account_info.data.borrow())?;
+        let mut destination_account = Account::unpack(destination_account_info.borrow_data())?;
         if destination_account.is_frozen() {
             return Err(TokenError::AccountFrozen.into());
         }
@@ -539,11 +579,11 @@ impl Processor {
         if destination_account.is_native() {
             return Err(TokenError::NativeNotSupported.into());
         }
-        if !Self::cmp_pubkeys(mint_info.key, &destination_account.mint) {
+        if !Self::cmp_pubkeys(mint_info.key(), &destination_account.mint) {
             return Err(TokenError::MintMismatch.into());
         }
 
-        let mut mint = Mint::unpack(&mint_info.data.borrow())?;
+        let mut mint = Mint::unpack(mint_info.borrow_data())?;
         if let Some(expected_decimals) = expected_decimals {
             if expected_decimals != mint.decimals {
                 return Err(TokenError::MintDecimalsMismatch.into());
@@ -575,11 +615,10 @@ impl Processor {
             .checked_add(amount)
             .ok_or(TokenError::Overflow)?;
 
-        Account::pack(
-            destination_account,
-            &mut destination_account_info.data.borrow_mut(),
-        )?;
-        Mint::pack(mint, &mut mint_info.data.borrow_mut())?;
+        Account::pack(destination_account, {
+            destination_account_info.borrow_data_mut()
+        })?;
+        Mint::pack(mint, mint_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -597,8 +636,8 @@ impl Processor {
         let mint_info = next_account_info(account_info_iter)?;
         let authority_info = next_account_info(account_info_iter)?;
 
-        let mut source_account = Account::unpack(&source_account_info.data.borrow())?;
-        let mut mint = Mint::unpack(&mint_info.data.borrow())?;
+        let mut source_account = Account::unpack(source_account_info.borrow_data())?;
+        let mut mint = Mint::unpack(mint_info.borrow_data())?;
 
         if source_account.is_frozen() {
             return Err(TokenError::AccountFrozen.into());
@@ -609,7 +648,7 @@ impl Processor {
         if source_account.amount < amount {
             return Err(TokenError::InsufficientFunds.into());
         }
-        if !Self::cmp_pubkeys(mint_info.key, &source_account.mint) {
+        if !Self::cmp_pubkeys(mint_info.key(), &source_account.mint) {
             return Err(TokenError::MintMismatch.into());
         }
 
@@ -619,9 +658,11 @@ impl Processor {
             }
         }
 
-        if !source_account.is_owned_by_system_program_or_incinerator() {
+        if !Account::is_owned_by_system_program_or_incinerator(&source_account.owner) {
             match source_account.delegate {
-                COption::Some(ref delegate) if Self::cmp_pubkeys(authority_info.key, delegate) => {
+                COption::Some(ref delegate)
+                    if Self::cmp_pubkeys(authority_info.key(), delegate) =>
+                {
                     Self::validate_owner(
                         program_id,
                         delegate,
@@ -663,8 +704,8 @@ impl Processor {
             .checked_sub(amount)
             .ok_or(TokenError::Overflow)?;
 
-        Account::pack(source_account, &mut source_account_info.data.borrow_mut())?;
-        Mint::pack(mint, &mut mint_info.data.borrow_mut())?;
+        Account::pack(source_account, source_account_info.borrow_data_mut())?;
+        Mint::pack(mint, mint_info.borrow_data_mut())?;
 
         Ok(())
     }
@@ -676,35 +717,36 @@ impl Processor {
         let destination_account_info = next_account_info(account_info_iter)?;
         let authority_info = next_account_info(account_info_iter)?;
 
-        if Self::cmp_pubkeys(source_account_info.key, destination_account_info.key) {
+        if Self::cmp_pubkeys(source_account_info.key(), destination_account_info.key()) {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        let source_account = Account::unpack(&source_account_info.data.borrow())?;
-        if !source_account.is_native() && source_account.amount != 0 {
+        let (source_is_native, source_amount, source_owner, source_close_authority) =
+            Account::unpack_for_close(source_account_info.borrow_data())?;
+        if !source_is_native && source_amount != 0 {
             return Err(TokenError::NonNativeHasBalance.into());
         }
 
-        let authority = source_account
-            .close_authority
-            .unwrap_or(source_account.owner);
-        if !source_account.is_owned_by_system_program_or_incinerator() {
+        let authority = source_close_authority.unwrap_or(source_owner);
+        if !Account::is_owned_by_system_program_or_incinerator(&source_owner) {
             Self::validate_owner(
                 program_id,
                 &authority,
                 authority_info,
                 account_info_iter.as_slice(),
             )?;
-        } else if !solana_program::incinerator::check_id(destination_account_info.key) {
+        } else if !solana_program::incinerator::check_id(destination_account_info.key()) {
             return Err(ProgramError::InvalidAccountData);
         }
 
         let destination_starting_lamports = destination_account_info.lamports();
-        **destination_account_info.lamports.borrow_mut() = destination_starting_lamports
-            .checked_add(source_account_info.lamports())
-            .ok_or(TokenError::Overflow)?;
+        destination_account_info.set_lamports(
+            destination_starting_lamports
+                .checked_add(source_account_info.lamports())
+                .ok_or(TokenError::Overflow)?,
+        );
+        source_account_info.set_lamports(0);
 
-        **source_account_info.lamports.borrow_mut() = 0;
         delete_account(source_account_info)?;
 
         Ok(())
@@ -722,18 +764,22 @@ impl Processor {
         let mint_info = next_account_info(account_info_iter)?;
         let authority_info = next_account_info(account_info_iter)?;
 
-        let mut source_account = Account::unpack(&source_account_info.data.borrow())?;
-        if freeze && source_account.is_frozen() || !freeze && !source_account.is_frozen() {
+        let (source_state, source_is_native, source_mint) =
+            Account::unpack_for_freeze(source_account_info.borrow_data())?;
+
+        if freeze && source_state == AccountState::Frozen
+            || !freeze && source_state != AccountState::Frozen
+        {
             return Err(TokenError::InvalidState.into());
         }
-        if source_account.is_native() {
+        if source_is_native {
             return Err(TokenError::NativeNotSupported.into());
         }
-        if !Self::cmp_pubkeys(mint_info.key, &source_account.mint) {
+        if !Self::cmp_pubkeys(mint_info.key(), &source_mint) {
             return Err(TokenError::MintMismatch.into());
         }
 
-        let mint = Mint::unpack(&mint_info.data.borrow_mut())?;
+        let mint = Mint::unpack(mint_info.borrow_data())?;
         match mint.freeze_authority {
             COption::Some(authority) => Self::validate_owner(
                 program_id,
@@ -744,13 +790,13 @@ impl Processor {
             COption::None => Err(TokenError::MintCannotFreeze.into()),
         }?;
 
-        source_account.state = if freeze {
+        let dst_state = if freeze {
             AccountState::Frozen
         } else {
             AccountState::Initialized
         };
 
-        Account::pack(source_account, &mut source_account_info.data.borrow_mut())?;
+        Account::write_state(source_account_info.borrow_data_mut(), dst_state);
 
         Ok(())
     }
@@ -761,12 +807,12 @@ impl Processor {
         let native_account_info = next_account_info(account_info_iter)?;
         Self::check_account_owner(program_id, native_account_info)?;
 
-        let mut native_account = Account::unpack(&native_account_info.data.borrow())?;
+        let mut native_account = Account::unpack(native_account_info.borrow_data())?;
 
-        if let COption::Some(rent_exempt_reserve) = native_account.is_native {
+        if native_account.is_native != 0 {
             let new_amount = native_account_info
                 .lamports()
-                .checked_sub(rent_exempt_reserve)
+                .checked_sub(native_account.rent_exempt_or_decimals_reserved)
                 .ok_or(TokenError::Overflow)?;
             if new_amount < native_account.amount {
                 return Err(TokenError::InvalidState.into());
@@ -776,7 +822,7 @@ impl Processor {
             return Err(TokenError::NonNativeNotSupported.into());
         }
 
-        Account::pack(native_account, &mut native_account_info.data.borrow_mut())?;
+        Account::pack(native_account, native_account_info.borrow_data_mut())?;
         Ok(())
     }
 
@@ -790,7 +836,7 @@ impl Processor {
         // make sure the mint is valid
         let mint_info = next_account_info(account_info_iter)?;
         Self::check_account_owner(program_id, mint_info)?;
-        let _ = Mint::unpack(&mint_info.data.borrow())
+        let _ = Mint::unpack(mint_info.borrow_data())
             .map_err(|_| Into::<ProgramError>::into(TokenError::InvalidMint))?;
         set_return_data(&Account::LEN.to_le_bytes());
         Ok(())
@@ -801,7 +847,7 @@ impl Processor {
     pub fn process_initialize_immutable_owner(accounts: &[AccountInfo]) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let token_account_info = next_account_info(account_info_iter)?;
-        let account = Account::unpack_unchecked(&token_account_info.data.borrow())?;
+        let account = Account::unpack_unchecked(token_account_info.borrow_data())?;
         if account.is_initialized() {
             return Err(TokenError::AlreadyInUse.into());
         }
@@ -820,7 +866,7 @@ impl Processor {
         let mint_info = next_account_info(account_info_iter)?;
         Self::check_account_owner(program_id, mint_info)?;
 
-        let mint = Mint::unpack(&mint_info.data.borrow_mut())
+        let mint = Mint::unpack(mint_info.borrow_data())
             .map_err(|_| Into::<ProgramError>::into(TokenError::InvalidMint))?;
         let ui_amount = amount_to_ui_amount_string_trimmed(amount, mint.decimals);
 
@@ -839,7 +885,7 @@ impl Processor {
         let mint_info = next_account_info(account_info_iter)?;
         Self::check_account_owner(program_id, mint_info)?;
 
-        let mint = Mint::unpack(&mint_info.data.borrow_mut())
+        let mint = Mint::unpack(mint_info.borrow_data())
             .map_err(|_| Into::<ProgramError>::into(TokenError::InvalidMint))?;
         let amount = try_ui_amount_into_amount(ui_amount.to_string(), mint.decimals)?;
 
@@ -968,7 +1014,7 @@ impl Processor {
 
     /// Checks that the account is owned by the expected program
     pub fn check_account_owner(program_id: &Pubkey, account_info: &AccountInfo) -> ProgramResult {
-        if !Self::cmp_pubkeys(program_id, account_info.owner) {
+        if !Self::cmp_pubkeys(program_id, account_info.owner()) {
             Err(ProgramError::IncorrectProgramId)
         } else {
             Ok(())
@@ -988,19 +1034,19 @@ impl Processor {
         owner_account_info: &AccountInfo,
         signers: &[AccountInfo],
     ) -> ProgramResult {
-        if !Self::cmp_pubkeys(expected_owner, owner_account_info.key) {
+        if !Self::cmp_pubkeys(expected_owner, owner_account_info.key()) {
             return Err(TokenError::OwnerMismatch.into());
         }
-        if Self::cmp_pubkeys(program_id, owner_account_info.owner)
-            && owner_account_info.data_len() == Multisig::get_packed_len()
+        if owner_account_info.data_len() == Multisig::get_packed_len()
+            && Self::cmp_pubkeys(program_id, owner_account_info.owner())
         {
-            let multisig = Multisig::unpack(&owner_account_info.data.borrow())?;
+            let multisig = Multisig::unpack(owner_account_info.borrow_data())?;
             let mut num_signers = 0;
             let mut matched = [false; MAX_SIGNERS];
             for signer in signers.iter() {
                 for (position, key) in multisig.signers[0..multisig.n as usize].iter().enumerate() {
-                    if Self::cmp_pubkeys(key, signer.key) && !matched[position] {
-                        if !signer.is_signer {
+                    if Self::cmp_pubkeys(key, signer.key()) && !matched[position] {
+                        if !signer.is_signer() {
                             return Err(ProgramError::MissingRequiredSignature);
                         }
                         matched[position] = true;
@@ -1012,7 +1058,7 @@ impl Processor {
                 return Err(ProgramError::MissingRequiredSignature);
             }
             return Ok(());
-        } else if !owner_account_info.is_signer {
+        } else if !owner_account_info.is_signer() {
             return Err(ProgramError::MissingRequiredSignature);
         }
         Ok(())
@@ -1023,18 +1069,22 @@ impl Processor {
 /// potentially muck around the bytes assuming that a vec is passed in, but that
 /// would be more trouble than it's worth.
 #[cfg(not(target_os = "solana"))]
-fn delete_account(account_info: &AccountInfo) -> Result<(), ProgramError> {
-    account_info.assign(&system_program::id());
-    let mut account_data = account_info.data.borrow_mut();
-    let data_len = account_data.len();
-    solana_program::program_memory::sol_memset(*account_data, 0, data_len);
+fn delete_account<AccountInfo: IAccountInfo>(
+    account_info: &AccountInfo,
+) -> Result<(), ProgramError> {
+    account_info.reassign(&system_program::id());
+    let data_len = account_info.data_len();
+    let data = account_info.borrow_data_mut();
+    solana_program::program_memory::sol_memset(data, 0, data_len);
     Ok(())
 }
 
 /// Helper function to totally delete an account on-chain
 #[cfg(target_os = "solana")]
-fn delete_account(account_info: &AccountInfo) -> Result<(), ProgramError> {
-    account_info.assign(&system_program::id());
+fn delete_account<AccountInfo: IAccountInfo>(
+    account_info: &AccountInfo,
+) -> Result<(), ProgramError> {
+    account_info.reassign(&system_program::id());
     account_info.realloc(0, false)
 }
 
@@ -1051,8 +1101,11 @@ mod tests {
             program_error::{self, PrintProgramError},
             sysvar::rent,
         },
-        solana_sdk::account::{
-            create_account_for_test, create_is_signer_account_infos, Account as SolanaAccount,
+        solana_sdk::{
+            account::{
+                create_account_for_test, create_is_signer_account_infos, Account as SolanaAccount,
+            },
+            account_info::AccountInfo,
         },
         std::sync::{Arc, RwLock},
     };
@@ -1216,7 +1269,8 @@ mod tests {
             amount: 3,
             delegate: COption::Some(Pubkey::new_from_array([4; 32])),
             state: AccountState::Frozen,
-            is_native: COption::Some(5),
+            is_native: 1,
+            rent_exempt_or_decimals_reserved: 5,
             delegated_amount: 6,
             close_authority: COption::Some(Pubkey::new_from_array([7; 32])),
         };

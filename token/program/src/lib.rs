@@ -1,6 +1,5 @@
 #![allow(clippy::arithmetic_side_effects)]
 #![deny(missing_docs)]
-#![cfg_attr(not(test), forbid(unsafe_code))]
 
 //! An ERC20-like Token program for the Solana blockchain
 
@@ -12,6 +11,8 @@ pub mod state;
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;
+
+mod nostd_adapter;
 
 // Export current sdk types for downstream users building with a different sdk
 // version
