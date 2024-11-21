@@ -1,4 +1,3 @@
-use std::ops::DerefMut;
 
 use solana_nostd_entrypoint::NoStdAccountInfo;
 use solana_program::{
@@ -14,9 +13,9 @@ pub trait IAccountInfo {
     fn data_len(&self) -> usize;
     fn reassign(&self, new_owner: &Pubkey);
     fn realloc(&self, new_len: usize, is_mutable: bool) -> Result<(), ProgramError>;
-    unsafe fn borrow_data(&self) -> &[u8];
-    unsafe fn borrow_data_mut(&self) -> &mut [u8];
-    unsafe fn borrow_mut_lamports(&self) -> &mut u64;
+    fn borrow_data(&self) -> &[u8];
+    fn borrow_data_mut(&self) -> &mut [u8];
+    fn set_lamports(&self, new_lamports: u64);
 }
 
 impl IAccountInfo for NoStdAccountInfo {
@@ -44,15 +43,15 @@ impl IAccountInfo for NoStdAccountInfo {
         NoStdAccountInfo::data_len(self)
     }
 
-    unsafe fn borrow_mut_lamports(&self) -> &mut u64 {
-        unsafe { NoStdAccountInfo::unchecked_borrow_mut_lamports(self) }
+    fn set_lamports(&self, new_lamports: u64) {
+        *unsafe { NoStdAccountInfo::unchecked_borrow_mut_lamports(self) } = new_lamports;
     }
 
-    unsafe fn borrow_data(&self) -> &[u8] {
+    fn borrow_data(&self) -> &[u8] {
         unsafe { NoStdAccountInfo::unchecked_borrow_data(self) }
     }
 
-    unsafe fn borrow_data_mut(&self) -> &mut [u8] {
+    fn borrow_data_mut(&self) -> &mut [u8] {
         unsafe { NoStdAccountInfo::unchecked_borrow_mut_data(self) }
     }
 
@@ -71,11 +70,11 @@ impl<'a> IAccountInfo for SolanaAccountInfo<'a> {
     }
 
     fn key(&self) -> &Pubkey {
-        &self.key
+        self.key
     }
 
     fn owner(&self) -> &Pubkey {
-        &self.owner
+        self.owner
     }
 
     fn is_signer(&self) -> bool {
@@ -98,21 +97,18 @@ impl<'a> IAccountInfo for SolanaAccountInfo<'a> {
         SolanaAccountInfo::realloc(self, new_len, is_mutable)
     }
 
-    unsafe fn borrow_data(&self) -> &[u8] {
-        // SAFETY: The caller must ensure exclusive access to the data
+    fn borrow_data(&self) -> &[u8] {
         let data = self.data.borrow();
-        core::slice::from_raw_parts(data.as_ptr(), data.len())
+        unsafe { core::slice::from_raw_parts(data.as_ptr(), data.len()) }
     }
 
-    unsafe fn borrow_data_mut(&self) -> &mut [u8] {
-        // SAFETY: The caller must ensure exclusive access to the data
+    fn borrow_data_mut(&self) -> &mut [u8] {
         let mut data = self.data.borrow_mut();
-        core::slice::from_raw_parts_mut(data.as_mut_ptr(), data.len())
+        unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr(), data.len()) }
     }
 
     /// super unsafe, but only used in tests
-    unsafe fn borrow_mut_lamports(&self) -> &mut u64 {
-        // SAFETY: The caller must ensure exclusive access to the lamports
-        &mut *(core::ptr::from_mut(self.lamports.borrow_mut().deref_mut()))
+    fn set_lamports(&self, new_lamports: u64) {
+        **self.lamports.borrow_mut() = new_lamports;
     }
 }
